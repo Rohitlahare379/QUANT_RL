@@ -46,8 +46,46 @@ async def validate_strategy(request: ValidationRequest):
                 "traceback": traceback.format_exc()
             }
         
-        if not hasattr(instance, "on_candle"):
-            return {"status": "error", "message": "Structure error: Missing required 'on_candle' method."}
+        # 2. Dry Run Phase
+        try:
+            from database import SessionLocal
+            from market_data.storage.models import MarketCandle
+            from simulator.runtime.engine import StrategyRunner
+            
+            db = SessionLocal()
+            # Fetch a few candles for the standard asset (BTCUSDT) to test
+            test_candles = db.query(MarketCandle).filter(MarketCandle.symbol == "BTCUSDT").limit(5).all()
+            db.close()
+            
+            if test_candles:
+                from market_data.normalizers.schemas import NormalizedCandle
+                runner = StrategyRunner(instance, strategy_name="ValidationRunner")
+                for candle in test_candles:
+                    # Convert SQLAlchemy to Pydantic
+                    pydantic_candle = NormalizedCandle(
+                        symbol=candle.symbol,
+                        timeframe=candle.timeframe,
+                        timestamp=candle.timestamp,
+                        open=candle.open,
+                        high=candle.high,
+                        low=candle.low,
+                        close=candle.close,
+                        volume=candle.volume,
+                        source=candle.source
+                    )
+                    decision = runner.process_candle(pydantic_candle)
+                    if "crashed" in decision.reasoning.lower():
+                        return {
+                            "status": "error",
+                            "message": f"Runtime error during dry-run: {decision.reasoning}"
+                        }
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Runtime error during dry-run: {str(e)}",
+                "traceback": traceback.format_exc()
+            }
             
         return {"status": "success", "message": "Strategy validated successfully."}
     except Exception as e:
@@ -58,6 +96,7 @@ async def validate_strategy(request: ValidationRequest):
             "traceback": traceback.format_exc()
         }
 
+@router.websocket("/replay")
 @router.websocket("/simulate")
 async def simulate_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -113,6 +152,10 @@ async def simulate_endpoint(websocket: WebSocket):
         symbol = config_data.get("symbol", "BTCUSDT")
         regime_id = config_data.get("regime", "covid_2020")
         
+        # 1. Configuration
+        timeframe = config_data.get("timeframe", "1h")
+        parameters = config_data.get("parameters", {})
+        
         # Load Strategy
         StrategyClass = StrategyLoader.load_from_string(strategy_code)
         if not StrategyClass:
@@ -120,6 +163,12 @@ async def simulate_endpoint(websocket: WebSocket):
             return
             
         strategy_instance = StrategyClass()
+        
+        # Apply parameters to strategy instance
+        if parameters:
+            for key, value in parameters.items():
+                logger.info(f"[Simulator] Applying parameter: {key} = {value}")
+                setattr(strategy_instance, key, value)
         
         # Regimes mapping and custom dataset support
         from simulator.regimes.manager import RegimeManager
@@ -137,9 +186,6 @@ async def simulate_endpoint(websocket: WebSocket):
                 regime = RegimeManager.get_regime("full_history")
             start_dt = regime["start"]
             end_dt = regime["end"]
-        
-        # 1. Configuration
-        timeframe = config_data.get("timeframe", "1h")
         
         replay_config = ReplayConfig(
             symbols=[symbol],
@@ -243,6 +289,9 @@ async def simulate_endpoint(websocket: WebSocket):
             latency_cost = ret_live - ret_slip
             
             # 4. Stream incremental updates to frontend
+            winning_trades = sum(1 for pnl in portfolio_live.realized_pnls if pnl > 0)
+            live_win_rate = (winning_trades / len(portfolio_live.realized_pnls) * 100) if portfolio_live.realized_pnls else 0.0
+
             update = {
                 "type": "update",
                 "progress": {
@@ -256,7 +305,8 @@ async def simulate_endpoint(websocket: WebSocket):
                 },
                 "balance": portfolio_live.state.current_balance,
                 "pnl": portfolio_live.state.current_balance - 10000.0,
-                "trade_count": len(portfolio_live.trade_logs),
+                "trade_count": len(portfolio_live.realized_pnls),
+                "win_rate": live_win_rate,
                 "signal": decision.signal.name if decision.signal != Signal.HOLD else None,
                 "metrics": {
                     "backtest_return": ret_ideal,
@@ -266,21 +316,21 @@ async def simulate_endpoint(websocket: WebSocket):
                 }
             }
             
-            if exec_record:
-                trade_info = {
-                    "action": "OPEN" if portfolio_live.state.open_positions else "CLOSE",
-                    "price": exec_record.execution_price,
-                    "qty": exec_record.quantity,
-                    "signal": exec_record.signal.name,
-                    "timestamp": exec_record.timestamp.isoformat()
-                }
-                # If closing, include the last realized PnL
-                if trade_info["action"] == "CLOSE" and portfolio_live.realized_pnls:
-                    trade_info["realized_pnl"] = portfolio_live.realized_pnls[-1]
-                
-                update["trade"] = trade_info
-                
             await websocket.send_json(update)
+
+            if exec_record:
+                await websocket.send_json({
+                    "type": "execution",
+                    "record": {
+                        "timestamp": exec_record.timestamp.isoformat(),
+                        "symbol": exec_record.symbol,
+                        "signal": exec_record.signal.name,
+                        "execution_price": exec_record.execution_price,
+                        "quantity": exec_record.quantity,
+                        "action": "OPEN" if portfolio_live.state.open_positions else "CLOSE",
+                        "realized_pnl": portfolio_live.realized_pnls[-1] if (not portfolio_live.state.open_positions and portfolio_live.realized_pnls) else None
+                    }
+                })
             
         # Calculate final metrics using Live portfolio
         logger.info(f"[Simulator] Final Metrics Summary: Realized Trades: {len(portfolio_live.realized_pnls)}, Current Balance: {portfolio_live.state.current_balance:.2f}")
@@ -292,11 +342,13 @@ async def simulate_endpoint(websocket: WebSocket):
             trade_pnls=portfolio_live.realized_pnls
         )
         
-        await websocket.send_json({
+        from fastapi.encoders import jsonable_encoder
+        await websocket.send_json(jsonable_encoder({
             "type": "complete",
             "status": "COMPLETED",
-            "metrics": metrics.model_dump()
-        })
+            "metrics": metrics.model_dump(),
+            "trades": [t.model_dump() for t in portfolio_live.trade_logs]
+        }))
 
         
     except WebSocketDisconnect:

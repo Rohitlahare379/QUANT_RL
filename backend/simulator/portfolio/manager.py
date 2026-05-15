@@ -149,19 +149,27 @@ class PortfolioManager:
         return record
 
     def _update_unrealized_pnl(self, current_candle: NormalizedCandle):
-        """Updates the portfolio equity curve without closing positions."""
-        unrealized_pnl = 0.0
-        position = self.state.open_positions.get(current_candle.symbol)
+        """Updates the portfolio equity curve by calculating unrealized PnL for all open positions."""
+        total_unrealized_pnl = 0.0
         
-        if position:
-            if position.side == Signal.BUY:
-                unrealized_pnl = (current_candle.close - position.entry_price) * position.size
-            elif position.side == Signal.SELL:
-                unrealized_pnl = (position.entry_price - current_candle.close) * position.size
-                
-        # Total equity is cash + original position costs + unrealized pnl
-        total_equity = self.state.available_cash
-        for pos in self.state.open_positions.values():
-             total_equity += (pos.entry_price * pos.size)
-             
-        self.state.current_balance = total_equity + unrealized_pnl
+        # We need current prices for all open positions to calculate equity.
+        # In a single-asset replay, we only have the current_candle for the traded asset.
+        # If there are positions in other assets, they would be static or we'd need their last price.
+        # For now, we update the pnl for the current_candle's symbol and assume others are at their last known price.
+        
+        for symbol, position in self.state.open_positions.items():
+            if symbol == current_candle.symbol:
+                # Update with newest price
+                if position.side == Signal.BUY:
+                    pnl = (current_candle.close - position.entry_price) * position.size
+                else:
+                    pnl = (position.entry_price - current_candle.close) * position.size
+                total_unrealized_pnl += pnl
+            else:
+                # Use a cached price or entry price if not the current symbol
+                # In this simulator's current state, we mostly deal with one symbol at a time.
+                pass
+                 
+        # Total equity = available cash + cost basis of all positions + total unrealized pnl
+        total_cost_basis = sum(pos.entry_price * pos.size for pos in self.state.open_positions.values())
+        self.state.current_balance = self.state.available_cash + total_cost_basis + total_unrealized_pnl

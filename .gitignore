@@ -171,3 +171,5 @@ dist-ssr/
 # Database
 *.db
 *.sqlite
+scratch/
+verification_report.md
